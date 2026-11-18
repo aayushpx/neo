@@ -1,3 +1,11 @@
+/*
+ * Neo: a Matrix-themed dodge game for the LilyGO T-Display.
+ *
+ * Bullets fall from the top of the screen and the player moves left and right
+ * to avoid them. Every bullet that passes scores points, the game speeds up
+ * over time, and a single hit ends the run.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <esp_timer.h>
@@ -6,6 +14,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <driver/gpio.h>
+#include "input_output.h"
 
 #ifdef TTGO_S3
 #define RIGHT_BUTTON 14
@@ -15,145 +24,148 @@
 
 #define LEFT_BUTTON 0
 
-void input_output_init();  // initialises gpio 0, 14, 35 as inputs 
-int storage_read_int(char *name, int def);  // reads highscore from NVS
-void storage_write_int(char *name, int val);  // writes highscore to NVS
-
-// 56x36 px player
+// Player hitbox, which is deliberately smaller than the 80x73 px sprite.
 #define PLAYER_W 56
 #define PLAYER_H 36
-#define PLAYER_SPEED 300
+#define PLAYER_SPRITE_H 73
+#define PLAYER_SPRITE_Y_OFFSET 7
+#define PLAYER_BOTTOM_MARGIN 2
+#define PLAYER_SPEED 300  // px/s
 
-// 10x31 px bullet
-#define BLOCK_W 10
-#define BLOCK_H 31
-#define MAX_BLOCKS 20
+// Bullet hitbox and pool size.
+#define BULLET_W 10
+#define BULLET_H 31
+#define MAX_BULLETS 20
 
-// Spawn 1.5 -> 0.3 seconds
+// Difficulty rises one step every 10 seconds.
+#define DIFFICULTY_STEP_US 10000000
 #define INITIAL_SPAWN_MS 1500
 #define MIN_SPAWN_MS 300
+#define SPAWN_STEP_MS 100
+#define INITIAL_FALL_SPEED 120  // px/s
+#define MAX_FALL_SPEED 600      // no further steps once this is reached
+#define FALL_SPEED_STEP 50      // px/s
 
-// Fall speed 120 -> 600 px/seconds
-#define INITIAL_FALL_SPEED 120
-#define MAX_FALL_SPEED 600
+#define SCORE_PER_DODGE 100
+#define MAX_FRAME_TIME_S 0.05f
+#define GAME_OVER_DELAY_MS 3000
 
-// Score
-#define SCORE_PER_MISS 100
+// Matrix rain on the title screen.
+#define RAIN_COLS 40
+#define RAIN_SPEED_MIN 30
+#define RAIN_SPEED_MAX 80
+#define RAIN_LENGTH_MIN 8
+#define RAIN_LENGTH_MAX 20
+#define RAIN_ROW_HEIGHT 12
 
-// Matrix rain constants
-#define MATRIX_RAIN_COLS 40
-#define MATRIX_RAIN_SPEED_MIN 30
-#define MATRIX_RAIN_SPEED_MAX 80
-#define MATRIX_RAIN_LENGTH_MIN 8
-#define MATRIX_RAIN_LENGTH_MAX 20
+static const char RAIN_SYMBOLS[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()";
 
+// Sprites exported from GIMP, defined in neo_main.c and bullet_main.c.
 extern image_header neo_main_image;
 extern image_header bullet_main_image;
 
 typedef struct {
-  float x, y;  // position
-  int w, h;  // dimensions
-  float xvel, yvel;  // velocity
-  uint16_t colour;  // RGB565 colour
-} obj;
+  float x, y;  // top-left position
+  int w, h;    // hitbox size; w == 0 marks an unused bullet slot
+  float yvel;  // fall speed in px/s
+} entity_t;
 
-static float last_rain_time = 0;  // time between rain frames
+typedef struct {
+  int col;                     // x position
+  int y;                       // y position of the top of the trail
+  int speed;                   // fall speed
+  int length;                  // trail length in characters
+  int chars[RAIN_LENGTH_MAX];  // characters in the trail
+} matrix_rain_t;
 
-static float getdt() {
-  /*
-   * Returns seconds since last call
-   */
+static float last_rain_time = 0;
+
+// Returns the seconds since the last call, capped so a stall cannot make
+// objects jump across the screen.
+static float get_frame_time(void) {
   static uint64_t last_time = 0;
   float dt;
   uint64_t current_time = esp_timer_get_time();
+
   if (last_time == 0) dt = 0;
   else dt = (current_time - last_time) / 1000000.0f;
-  if (dt > 0.05f) dt = 0.05f;
+
+  if (dt > MAX_FRAME_TIME_S) dt = MAX_FRAME_TIME_S;
   last_time = current_time;
   return dt;
 }
 
-static int overlap(obj *r1, obj *r2) {
-  /*
-   * Collision detection. Returns 1 if overlapping
-   */
-  if (r1->x < r2->x + r2->w && r1->x + r1->w > r2->x
-    && r1->y < r2->y + r2->h && r1->y + r1->h > r2->y)
-    return 1;
-  return 0;
+// Axis-aligned bounding box collision test.
+static int overlap(const entity_t *a, const entity_t *b) {
+  return a->x < b->x + b->w && a->x + a->w > b->x &&
+         a->y < b->y + b->h && a->y + a->h > b->y;
 }
 
-typedef struct {
-  int col;  // column
-  int y;  // offset
-  int speed;  // fall speed
-  int length;  // trail length
-  int chars[MATRIX_RAIN_LENGTH_MAX];  // char codes
-} matrix_rain_t;
+static char random_rain_symbol(void) {
+  return RAIN_SYMBOLS[rand() % (sizeof(RAIN_SYMBOLS) - 1)];
+}
 
-static float draw_matrix_rain(matrix_rain_t *rain, int bright) {
-  /*
-   * Renders matrix rain
-   */
-  float dt;
+static int random_rain_speed(void) {
+  return rand() % (RAIN_SPEED_MAX - RAIN_SPEED_MIN) + RAIN_SPEED_MIN;
+}
+
+static int random_rain_length(void) {
+  return rand() % (RAIN_LENGTH_MAX - RAIN_LENGTH_MIN) + RAIN_LENGTH_MIN;
+}
+
+// Draws one frame of rain and advances every column.
+static void draw_matrix_rain(matrix_rain_t *rain, int bright) {
   uint64_t time = esp_timer_get_time();
-  dt = (time - last_rain_time) / 1000000.0f;  // dt from last rain time
+  float dt = (time - last_rain_time) / 1000000.0f;
   last_rain_time = time;
 
-  for (int i = 0; i < MATRIX_RAIN_COLS; i++) {  // 40 column loop
-    matrix_rain_t *r = &rain[i];  // current column
+  for (int i = 0; i < RAIN_COLS; i++) {
+    matrix_rain_t *r = &rain[i];
 
-    for (int j = 0; j < r->length; j++) {  // loop through chars
-      int draw_y = r->y + j * 12;  // screen position (y)
-      if (draw_y >= 0 && draw_y < display_height) {  // only draw if on screen
-
-        // Colour gradient 
+    for (int j = 0; j < r->length; j++) {
+      int draw_y = r->y + j * RAIN_ROW_HEIGHT;
+      if (draw_y >= 0 && draw_y < display_height) {
+        // The leading character is brightest and the trail fades behind it.
         if (j == r->length - 1) {
-          setFontColour(0, bright, bright / 3);  // Brightest green
+          setFontColour(0, bright, bright / 3);
         } else if (j >= r->length - 3) {
           setFontColour(0, bright * 2 / 3, bright / 5);
         } else if (j >= r->length - 6) {
           setFontColour(0, bright / 2, bright / 8);
         } else {
-          setFontColour(0, bright / 4, bright / 16);  // Dim
+          setFontColour(0, bright / 4, bright / 16);
         }
 
         char c[2] = {r->chars[j], '\0'};
-        print_xy(c, r->col, draw_y);  // print single char
+        print_xy(c, r->col, draw_y);
       }
     }
 
-    r->y += (int)(r->speed * dt * 10);  // advance column downward
+    r->y += (int)(r->speed * dt * 10);
 
-    // Reset column when off screen
-    if (r->y > display_height + r->length * 12) {
+    // Recycle the column with new properties once it leaves the screen.
+    if (r->y > display_height + r->length * RAIN_ROW_HEIGHT) {
       r->y = -(rand() % display_height);
-      r->speed = rand() % (MATRIX_RAIN_SPEED_MAX - MATRIX_RAIN_SPEED_MIN) + MATRIX_RAIN_SPEED_MIN;
-      r->length = rand() % (MATRIX_RAIN_LENGTH_MAX - MATRIX_RAIN_LENGTH_MIN) + MATRIX_RAIN_LENGTH_MIN;
+      r->speed = random_rain_speed();
+      r->length = random_rain_length();
       for (int j = 0; j < r->length; j++) {
-        r->chars[j] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()"[rand() % 46];
+        r->chars[j] = random_rain_symbol();
       }
     }
   }
-  return dt;
 }
 
 static void init_matrix_rain(matrix_rain_t *rain) {
   last_rain_time = esp_timer_get_time();
-  const char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()";  // char set
-  for (int i = 0; i < MATRIX_RAIN_COLS; i++) {  // loop 40 columns
-    
-    // Position
-    rain[i].col = (display_width / MATRIX_RAIN_COLS) * i + (display_width / MATRIX_RAIN_COLS / 2);
+
+  for (int i = 0; i < RAIN_COLS; i++) {
+    rain[i].col = (display_width / RAIN_COLS) * i + (display_width / RAIN_COLS / 2);
     rain[i].y = -(rand() % display_height);
+    rain[i].speed = random_rain_speed();
+    rain[i].length = random_rain_length();
 
-    // Random fall speed
-    rain[i].speed = rand() % (MATRIX_RAIN_SPEED_MAX - MATRIX_RAIN_SPEED_MIN) + MATRIX_RAIN_SPEED_MIN;
-    rain[i].length = rand() % (MATRIX_RAIN_LENGTH_MAX - MATRIX_RAIN_LENGTH_MIN) + MATRIX_RAIN_LENGTH_MIN;
-
-    // Fill char arr with random symbols
     for (int j = 0; j < rain[i].length; j++) {
-      rain[i].chars[j] = symbols[rand() % (sizeof(symbols) - 1)];
+      rain[i].chars[j] = random_rain_symbol();
     }
   }
 }
@@ -205,60 +217,50 @@ static void draw_game_over(int score, int high_score) {
 
   setFont(FONT_UBUNTU16);
   setFontColour(100, 200, 100);
-  print_xy("GET READY", CENTER, 200); 
+  print_xy("GET READY", CENTER, 200);
   print_xy("FOR", CENTER, 220);
   print_xy("THE NEXT BATTLE", CENTER, 240);
 
   flip_frame();
 }
 
-static void spawn_block(obj *block, int fall_speed) {
-  /*
-   * Takes pointer to a single object-block and current fall speed.
-   */
-
-  // Block dimensions
-  block->w = BLOCK_W; 
-  block->h = BLOCK_H;
-  block->x = rand() % (display_width - BLOCK_W); // random x-position, display_width - 10
-  block->y = -BLOCK_H;  // start y-position, -31
-  block->yvel = fall_speed; // 120 -> 600
-  block->xvel = 0;  // unused, blocks fall straight down
-  block->colour = rgbToColour(220, 50, 50); //  red
+// Activates a bullet slot just above the screen at a random x position.
+static void spawn_bullet(entity_t *bullet, int fall_speed) {
+  bullet->w = BULLET_W;
+  bullet->h = BULLET_H;
+  bullet->x = rand() % (display_width - BULLET_W);
+  bullet->y = -BULLET_H;
+  bullet->yvel = fall_speed;
 }
 
-static void falling_blocks_game() {
-  // Allocate 20 blocks + 40 rain columns
-  obj *blocks = malloc(sizeof(obj) * MAX_BLOCKS);
-  if (!blocks) return;
+// Runs the title screen and one full game, returning after the player is hit.
+static void run_game(void) {
+  entity_t *bullets = malloc(sizeof(entity_t) * MAX_BULLETS);
+  if (!bullets) return;
 
-  matrix_rain_t *matrix_rain = malloc(sizeof(matrix_rain_t) * MATRIX_RAIN_COLS);
+  matrix_rain_t *matrix_rain = malloc(sizeof(matrix_rain_t) * RAIN_COLS);
   if (!matrix_rain) {
-    free(blocks);  // free what was allocated
+    free(bullets);
     return;
   }
 
   set_orientation(PORTRAIT);
-  init_matrix_rain(matrix_rain); // rain columns
-  int high_score = storage_read_int("highscore", 0); // read NVS
+  init_matrix_rain(matrix_rain);
+  int high_score = storage_read_int("highscore", 0);
 
-  obj player;
-  player.x = (display_width - PLAYER_W) / 2;  // center x
-  player.y = (display_height - 73) - 2;  // 73: player height
+  entity_t player;
+  player.x = (display_width - PLAYER_W) / 2;
+  player.y = (display_height - PLAYER_SPRITE_H) - PLAYER_BOTTOM_MARGIN;
   player.w = PLAYER_W;
   player.h = PLAYER_H;
-  player.xvel = 0;
   player.yvel = 0;
-  player.colour = rgbToColour(0, 255, 100);  // green player
 
-  // Block arr initialisation
-  for (int i = 0; i < MAX_BLOCKS; i++) {
-    blocks[i].w = 0;
-    blocks[i].h = 0;
-    blocks[i].yvel = 0;
+  for (int i = 0; i < MAX_BULLETS; i++) {
+    bullets[i].w = 0;
+    bullets[i].h = 0;
+    bullets[i].yvel = 0;
   }
 
-  // Game state variables
   int score = 0;
   int spawn_interval_ms = INITIAL_SPAWN_MS;
   int fall_speed = INITIAL_FALL_SPEED;
@@ -266,9 +268,10 @@ static void falling_blocks_game() {
   uint64_t difficulty_timer = esp_timer_get_time();
 
   setFont(FONT_UBUNTU16);
-  setFontColour(255, 255, 255); // white
+  setFontColour(255, 255, 255);
 
-  // Title screen
+  // Show the title until LEFT is pressed, then wait for it to be released so
+  // the same press does not also move the player. Buttons are active low.
   do {
     draw_title_screen(matrix_rain);
   } while (gpio_get_level(LEFT_BUTTON));
@@ -278,56 +281,57 @@ static void falling_blocks_game() {
   }
 
   while (1) {
-    float dt = getdt(); // delta time
+    float dt = get_frame_time();
 
     cls(rgbToColour(5, 20, 5));
 
-    if (!gpio_get_level(LEFT_BUTTON)) {  // 0 = pressed
-      player.x -= PLAYER_SPEED * dt;  // 300 px/second
-      if (player.x < 0) player.x = 0;  // left boundary
+    // Player movement, clamped to the screen edges.
+    if (!gpio_get_level(LEFT_BUTTON)) {
+      player.x -= PLAYER_SPEED * dt;
+      if (player.x < 0) player.x = 0;
     }
     if (!gpio_get_level(RIGHT_BUTTON)) {
       player.x += PLAYER_SPEED * dt;
-      if (player.x > display_width - player.w) player.x = display_width - player.w; // right boundary
+      if (player.x > display_width - player.w) player.x = display_width - player.w;
     }
 
-    // Spawn new block
+    // Spawn into the first free slot. If the pool is full, this spawn is skipped.
     uint64_t now_ms = esp_timer_get_time() / 1000;
     if (now_ms - last_spawn_time >= (uint64_t)spawn_interval_ms) {
-      for (int i = 0; i < MAX_BLOCKS; i++) {
-        if (blocks[i].w == 0) {  // final empty index
-          spawn_block(&blocks[i], fall_speed);
+      for (int i = 0; i < MAX_BULLETS; i++) {
+        if (bullets[i].w == 0) {
+          spawn_bullet(&bullets[i], fall_speed);
           break;
         }
       }
       last_spawn_time = now_ms;
     }
 
-    // Difficulty increases every 10 seconds
+    // Difficulty ramp. Bullets already in the air speed up too.
     uint64_t now = esp_timer_get_time();
-    if (now - difficulty_timer >= 10000000) {
+    if (now - difficulty_timer >= DIFFICULTY_STEP_US) {
       difficulty_timer = now;
       if (spawn_interval_ms > MIN_SPAWN_MS) {
-        spawn_interval_ms -= 100;
+        spawn_interval_ms -= SPAWN_STEP_MS;
       }
       if (fall_speed < MAX_FALL_SPEED) {
-        fall_speed += 50;
-        for (int i = 0; i < MAX_BLOCKS; i++) {
-          if (blocks[i].w > 0) {
-            blocks[i].yvel = fall_speed;  // update active blocks
+        fall_speed += FALL_SPEED_STEP;
+        for (int i = 0; i < MAX_BULLETS; i++) {
+          if (bullets[i].w > 0) {
+            bullets[i].yvel = fall_speed;
           }
         }
       }
     }
 
-    // Update blocks off-screen
-    for (int i = 0; i < MAX_BLOCKS; i++) {
-      if (blocks[i].w > 0) {
-        blocks[i].y += blocks[i].yvel * dt;  // move down
-        if (blocks[i].y > display_height) {  // past bottom
-          blocks[i].w = 0;  // deactivate
-          blocks[i].h = 0;
-          score += SCORE_PER_MISS;  // +100 score
+    // Move bullets. One that leaves the screen frees its slot and scores.
+    for (int i = 0; i < MAX_BULLETS; i++) {
+      if (bullets[i].w > 0) {
+        bullets[i].y += bullets[i].yvel * dt;
+        if (bullets[i].y > display_height) {
+          bullets[i].w = 0;
+          bullets[i].h = 0;
+          score += SCORE_PER_DODGE;
           if (score > high_score) {
             high_score = score;
             storage_write_int("highscore", high_score);
@@ -336,25 +340,28 @@ static void falling_blocks_game() {
       }
     }
 
-    // Collision Detection
-    for (int i = 0; i < MAX_BLOCKS; i++) {
-      if (blocks[i].w > 0 && overlap(&player, &blocks[i])) {
+    // A single hit ends the run.
+    for (int i = 0; i < MAX_BULLETS; i++) {
+      if (bullets[i].w > 0 && overlap(&player, &bullets[i])) {
         draw_game_over(score, high_score);
-        vTaskDelay(pdMS_TO_TICKS(3000)); // 3 sec delay
+        vTaskDelay(pdMS_TO_TICKS(GAME_OVER_DELAY_MS));
         free(matrix_rain);
-        free(blocks);
-        return;  // exit to app_main
-      }
-    }
-    draw_image(&neo_main_image, player.x + PLAYER_W / 2, player.y + PLAYER_H / 2 + 7);
-
-    for (int i = 0; i < MAX_BLOCKS; i++) {
-      if (blocks[i].w > 0) {
-        draw_image(&bullet_main_image, blocks[i].x + BLOCK_W / 2, blocks[i].y + BLOCK_H / 2);
+        free(bullets);
+        return;
       }
     }
 
-    // Current score
+    // draw_image positions sprites by their centre.
+    draw_image(&neo_main_image, player.x + PLAYER_W / 2,
+               player.y + PLAYER_H / 2 + PLAYER_SPRITE_Y_OFFSET);
+
+    for (int i = 0; i < MAX_BULLETS; i++) {
+      if (bullets[i].w > 0) {
+        draw_image(&bullet_main_image, bullets[i].x + BULLET_W / 2,
+                   bullets[i].y + BULLET_H / 2);
+      }
+    }
+
     char buf[32];
     sprintf(buf, "Score: %d", score);
     print_xy(buf, 5, 5);
@@ -365,13 +372,13 @@ static void falling_blocks_game() {
   }
 }
 
-void app_main() {
+void app_main(void) {
   input_output_init();
   graphics_init();
   cls(0);
 
   while (1) {
-    falling_blocks_game();
+    run_game();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }

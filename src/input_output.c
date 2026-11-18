@@ -2,15 +2,16 @@
 #include "input_output.h"
 #include <nvs_flash.h>
 
+// Opens the storage namespace, initialising NVS on first use.
 static nvs_handle_t storage_open(nvs_open_mode_t mode) {
     esp_err_t err;
-    nvs_handle_t my_handle;
-    err = nvs_open("storage", mode, &my_handle);
+    nvs_handle_t handle;
+    err = nvs_open("storage", mode, &handle);
     if (err != 0) {
         nvs_flash_init();
-        err = nvs_open("storage", mode, &my_handle);
+        err = nvs_open("storage", mode, &handle);
     }
-    return my_handle;
+    return handle;
 }
 
 int storage_read_int(char *name, int def) {
@@ -28,7 +29,7 @@ void storage_write_int(char *name, int val) {
     nvs_close(handle);
 }
 
-void input_output_init() {
+void input_output_init(void) {
     gpio_set_direction(0, GPIO_MODE_INPUT);
     gpio_set_direction(14, GPIO_MODE_INPUT);
     gpio_set_direction(35, GPIO_MODE_INPUT);
